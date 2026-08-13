@@ -1,0 +1,541 @@
+/************************************************************
+SVM FLOOD MAPPING
+Train 2021 → Apply 2025 → Compare with 2025 reference
+************************************************************/
+
+/************************************************************
+Imports
+************************************************************/
+var studyArea = table;
+var flood2025 = table6;
+var flood2021 = table5;
+
+/************************************************************
+Dates
+************************************************************/
+var trainPreStart  = '2021-01-01';
+var trainPreEnd    = '2021-01-15';
+var trainPostStart = '2021-01-20';
+var trainPostEnd   = '2021-01-26';
+
+var testPreStart   = '2024-12-10';
+var testPreEnd     = '2024-12-25';
+var testPostStart  = '2025-01-01';
+var testPostEnd    = '2025-01-07';
+
+/************************************************************
+Settings
+************************************************************/
+var orbitPass = 'DESCENDING';
+var sampleScale = 10;
+var pointsPerClass = 1500;
+var randomSeed = 42;
+var compareBufferMeters = 50;
+
+/************************************************************
+Functions
+************************************************************/
+function dbToNatural(img) {
+  return ee.Image(10).pow(img.divide(10));
+}
+
+function naturalToDb(img) {
+  return ee.Image(img).log10().multiply(10);
+}
+
+function reduceSpeckleNoise(image) {
+  var vvNat = dbToNatural(image.select('VV'));
+  var vhNat = dbToNatural(image.select('VH'));
+
+  var vvFiltered = vvNat.focal_median({
+    radius: 20,
+    units: 'meters'
+  });
+
+  var vhFiltered = vhNat.focal_median({
+    radius: 20,
+    units: 'meters'
+  });
+
+  return ee.Image.cat([
+    naturalToDb(vvFiltered).rename('VV'),
+    naturalToDb(vhFiltered).rename('VH')
+  ]).copyProperties(image, image.propertyNames());
+}
+
+/************************************************************
+Sentinel-1 collection
+************************************************************/
+var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(studyArea)
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  .filter(ee.Filter.eq('resolution_meters', 10))
+  .filter(ee.Filter.eq('orbitProperties_pass', orbitPass))
+  .select(['VV', 'VH']);
+
+function buildS1Composite(preStart, preEnd, postStart, postEnd, region) {
+  var preCol = s1.filterDate(preStart, preEnd);
+  var postCol = s1.filterDate(postStart, postEnd);
+
+  print('Pre count ' + preStart + ' to ' + preEnd, preCol.size());
+  print('Post count ' + postStart + ' to ' + postEnd, postCol.size());
+
+  var pre = preCol.map(reduceSpeckleNoise).median().clip(region);
+  var post = postCol.map(reduceSpeckleNoise).median().clip(region);
+
+  return {
+    pre: pre,
+    post: post
+  };
+}
+
+function buildS1Features(preImg, postImg) {
+  var preVV = preImg.select('VV').rename('preVV');
+  var preVH = preImg.select('VH').rename('preVH');
+
+  var postVV = postImg.select('VV').rename('postVV');
+  var postVH = postImg.select('VH').rename('postVH');
+
+  var diffVV = preVV.subtract(postVV).rename('diffVV');
+  var diffVH = preVH.subtract(postVH).rename('diffVH');
+
+
+
+  return ee.Image.cat([
+    preVV, preVH,
+    postVV, postVH,
+    diffVV, diffVH,
+  ]);
+}
+
+/************************************************************
+Terrain features
+************************************************************/
+var dem = ee.Image('USGS/SRTMGL1_003')
+  .select('elevation')
+  .clip(studyArea)
+  .rename('DEM');
+
+var slope = ee.Terrain.slope(dem).rename('slope');
+
+var rivers = ee.FeatureCollection('WWF/HydroSHEDS/v1/FreeFlowingRivers')
+  .filterBounds(studyArea);
+
+var riverRaster = ee.Image()
+  .byte()
+  .paint({
+    featureCollection: rivers,
+    color: 1
+  })
+  .clip(studyArea);
+
+var distanceToRiver = riverRaster
+  .fastDistanceTransform(1024)
+  .sqrt()
+  .multiply(ee.Image.pixelArea().sqrt())
+  .unmask(99999)
+  .rename('distanceToRiver')
+  .clip(studyArea);
+
+var waterOccurrence = ee.Image('JRC/GSW1_4/GlobalSurfaceWater')
+  .select('occurrence')
+  .unmask(0)
+  .clip(studyArea)
+  .rename('waterOccurrence');
+
+var terrainFeatures = ee.Image.cat([
+  dem,
+  slope,
+  distanceToRiver,
+  waterOccurrence
+]).toFloat();
+
+/************************************************************
+Build train/test features
+************************************************************/
+var trainS1 = buildS1Composite(
+  trainPreStart,
+  trainPreEnd,
+  trainPostStart,
+  trainPostEnd,
+  studyArea
+);
+
+var testS1 = buildS1Composite(
+  testPreStart,
+  testPreEnd,
+  testPostStart,
+  testPostEnd,
+  studyArea
+);
+
+var trainFeatures = buildS1Features(trainS1.pre, trainS1.post)
+  .addBands(terrainFeatures)
+  .toFloat();
+
+var testFeatures = buildS1Features(testS1.pre, testS1.post)
+  .addBands(terrainFeatures)
+  .toFloat();
+
+var bandNames = trainFeatures.bandNames();
+
+print('Bands:', bandNames);
+
+/************************************************************
+2021 training label
+************************************************************/
+var flood2021Raster = ee.Image()
+  .byte()
+  .paint({
+    featureCollection: flood2021,
+    color: 1
+  })
+  .selfMask()
+  .clip(studyArea);
+
+var label2021 = ee.Image.constant(0)
+  .clip(studyArea)
+  .where(flood2021Raster, 1)
+  .rename('class')
+  .toByte();
+
+/************************************************************
+Standardization for SVM
+Important: compute mean/std from 2021 training features only
+************************************************************/
+var meanDict = trainFeatures.reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: studyArea.geometry(),
+  scale: 10,
+  maxPixels: 1e13,
+  tileScale: 4
+});
+
+var stdDict = trainFeatures.reduceRegion({
+  reducer: ee.Reducer.stdDev(),
+  geometry: studyArea.geometry(),
+  scale: 10,
+  maxPixels: 1e13,
+  tileScale: 4
+});
+
+function standardizeImage(img) {
+  var meanImg = ee.Image.constant(
+    bandNames.map(function(b) {
+      return ee.Number(meanDict.get(ee.String(b)));
+    })
+  ).rename(bandNames);
+
+  var stdImg = ee.Image.constant(
+    bandNames.map(function(b) {
+      return ee.Number(stdDict.get(ee.String(b)));
+    })
+  ).rename(bandNames);
+
+  return img.select(bandNames)
+    .subtract(meanImg)
+    .divide(stdImg)
+    .rename(bandNames)
+    .toFloat();
+}
+
+var trainScaled = standardizeImage(trainFeatures);
+var testScaled = standardizeImage(testFeatures);
+
+/************************************************************
+Training samples
+************************************************************/
+var trainingImage = trainScaled.addBands(label2021);
+
+var samples = trainingImage.stratifiedSample({
+  numPoints: pointsPerClass,
+  classBand: 'class',
+  region: studyArea.geometry(),
+  scale: sampleScale,
+  seed: randomSeed,
+  geometries: false,
+  dropNulls: true,
+  tileScale: 4
+});
+
+print('Training samples:', samples.size());
+print('Class distribution:', samples.aggregate_histogram('class'));
+
+/************************************************************
+Train SVM
+************************************************************/
+var svmClassifier = ee.Classifier.libsvm({
+  kernelType: 'RBF',
+  gamma: 0.01,
+  cost: 100
+}).train({
+  features: samples,
+  classProperty: 'class',
+  inputProperties: bandNames
+});
+
+/************************************************************
+Apply SVM to 2025
+************************************************************/
+var finalFlood2025 = testScaled
+  .classify(svmClassifier)
+  .rename('pred_raw')
+  .selfMask();
+
+/************************************************************
+Morphological cleaning
+************************************************************/
+finalFlood2025 = finalFlood2025
+  .focal_max({
+    radius: 10,
+    units: 'meters'
+  })
+  .focal_min({
+    radius: 10,
+    units: 'meters'
+  })
+  .selfMask();
+
+/************************************************************
+Comparison region
+************************************************************/
+var compareRegion = flood2025.geometry()
+  .buffer(compareBufferMeters);
+
+/************************************************************
+2025 reference raster
+************************************************************/
+var official2025Raster = ee.Image()
+  .byte()
+  .paint({
+    featureCollection: flood2025,
+    color: 1
+  })
+  .selfMask()
+  .clip(compareRegion);
+
+/************************************************************
+Prediction and reference binary
+************************************************************/
+var predBin = finalFlood2025
+  .unmask(0)
+  .clip(compareRegion)
+  .rename('pred');
+
+var refBin = ee.Image.constant(0)
+  .clip(compareRegion)
+  .where(official2025Raster, 1)
+  .rename('ref');
+
+/************************************************************
+Confusion masks
+************************************************************/
+var tp = predBin.eq(1).and(refBin.eq(1)).selfMask();
+var fp = predBin.eq(1).and(refBin.eq(0)).selfMask();
+var fn = predBin.eq(0).and(refBin.eq(1)).selfMask();
+var tn = predBin.eq(0).and(refBin.eq(0)).selfMask();
+
+/************************************************************
+Area function
+************************************************************/
+function calcAreaKm2(maskImage, region) {
+  var area = ee.Image.pixelArea()
+    .updateMask(maskImage)
+    .reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: region,
+      scale: 10,
+      maxPixels: 1e13,
+      tileScale: 4
+    })
+    .values()
+    .get(0);
+
+  area = ee.Number(ee.Algorithms.If(area, area, 0));
+  return area.divide(1e6);
+}
+
+/************************************************************
+Metrics
+************************************************************/
+var tpArea = calcAreaKm2(tp, compareRegion);
+var fpArea = calcAreaKm2(fp, compareRegion);
+var fnArea = calcAreaKm2(fn, compareRegion);
+var tnArea = calcAreaKm2(tn, compareRegion);
+
+var predictedArea = calcAreaKm2(predBin.selfMask(), compareRegion);
+var officialArea = calcAreaKm2(refBin.selfMask(), compareRegion);
+
+var precision = ee.Number(ee.Algorithms.If(
+  tpArea.add(fpArea).gt(0),
+  tpArea.divide(tpArea.add(fpArea)),
+  0
+));
+
+var recall = ee.Number(ee.Algorithms.If(
+  tpArea.add(fnArea).gt(0),
+  tpArea.divide(tpArea.add(fnArea)),
+  0
+));
+
+var f1 = ee.Number(ee.Algorithms.If(
+  precision.add(recall).gt(0),
+  precision.multiply(recall).multiply(2).divide(precision.add(recall)),
+  0
+));
+
+var iou = ee.Number(ee.Algorithms.If(
+  tpArea.add(fpArea).add(fnArea).gt(0),
+  tpArea.divide(tpArea.add(fpArea).add(fnArea)),
+  0
+));
+
+var accuracy = ee.Number(ee.Algorithms.If(
+  tpArea.add(fpArea).add(fnArea).add(tnArea).gt(0),
+  tpArea.add(tnArea).divide(tpArea.add(fpArea).add(fnArea).add(tnArea)),
+  0
+));
+
+/************************************************************
+Print results
+************************************************************/
+print('========== MODEL ==========');
+print('SVM using Sentinel-1 + terrain features');
+print('Training on 2021, applying to 2025');
+print('Kernel: RBF, gamma: 0.01, cost: 100');
+
+print('========== 2025 METRICS ==========');
+print('Official flood area in buffer km2:', officialArea);
+print('Predicted flood area in buffer km2:', predictedArea);
+
+print('TP area km2:', tpArea);
+print('FP area km2:', fpArea);
+print('FN area km2:', fnArea);
+print('TN area km2:', tnArea);
+
+print('Precision:', precision);
+print('Recall:', recall);
+print('F1-score:', f1);
+print('IoU:', iou);
+print('Accuracy:', accuracy);
+
+print(
+  'Predicted flood area whole study area km2:',
+  calcAreaKm2(finalFlood2025, studyArea.geometry())
+);
+
+/************************************************************
+Map display
+************************************************************/
+Map.centerObject(studyArea, 11);
+
+Map.addLayer(
+  ee.Image().paint(studyArea, 1, 2),
+  {palette: ['FF0000']},
+  'Study Area',
+  true
+);
+
+Map.addLayer(
+  flood2021Raster,
+  {palette: ['FFA500']},
+  'Flood 2021 Reference',
+  false
+);
+
+Map.addLayer(
+  official2025Raster,
+  {palette: ['FFFF00']},
+  'Flood 2025 Reference',
+  true
+);
+
+Map.addLayer(
+  ee.Image().paint(compareRegion, 1, 2),
+  {palette: ['FF00FF']},
+  'Comparison Region',
+  true
+);
+
+Map.addLayer(
+  finalFlood2025.clip(compareRegion),
+  {palette: ['00FFFF']},
+  'SVM Predicted Flood 2025 inside buffer',
+  true
+);
+
+Map.addLayer(
+  finalFlood2025,
+  {palette: ['00FFFF']},
+  'SVM Predicted Flood 2025 whole study area',
+  false
+);
+
+Map.addLayer(tp, {palette: ['00FF00']}, 'TP', true);
+Map.addLayer(fp, {palette: ['0000FF']}, 'FP', false);
+Map.addLayer(fn, {palette: ['FFA500']}, 'FN', false);
+/************************************************************
+ SVM: Grass outside official flood classified as flood
+ Whole study area
+ ************************************************************/
+
+var worldCover = ee.ImageCollection('ESA/WorldCover/v200')
+  .first()
+  .select('Map')
+  .clip(studyArea);
+
+var grassMask = worldCover.eq(30).selfMask();
+
+var official2025RasterStudyArea = ee.Image()
+  .byte()
+  .paint({
+    featureCollection: flood2025,
+    color: 1
+  })
+  .selfMask()
+  .clip(studyArea);
+
+var grassOutsideOfficial2025 = grassMask
+  .updateMask(official2025RasterStudyArea.unmask(0).not())
+  .selfMask()
+  .clip(studyArea);
+
+var grassOutsideOfficial_Flood_SVM = finalFlood2025
+  .updateMask(grassOutsideOfficial2025)
+  .selfMask()
+  .clip(studyArea);
+
+var grassOutsideOfficialAreaKm2 = calcAreaKm2(
+  grassOutsideOfficial2025,
+  studyArea.geometry()
+);
+
+var grassOutsideOfficialFloodKm2 = calcAreaKm2(
+  grassOutsideOfficial_Flood_SVM,
+  studyArea.geometry()
+);
+
+var grassOutsideOfficialFloodPercent = grassOutsideOfficialFloodKm2
+  .divide(grassOutsideOfficialAreaKm2)
+  .multiply(100);
+
+print('========== SVM: Grass outside official flood - whole study area ==========');
+print('Grass outside official flood area, km²:', grassOutsideOfficialAreaKm2);
+print('Grass outside official classified as flood by SVM, km²:', grassOutsideOfficialFloodKm2);
+print('Percent of grass outside official classified as flood by SVM, %:', grassOutsideOfficialFloodPercent);
+
+Map.addLayer(
+  grassOutsideOfficial2025,
+  {palette: ['00FF00']},
+  'Grass outside official flood 2025',
+  false
+);
+
+Map.addLayer(
+  grassOutsideOfficial_Flood_SVM,
+  {palette: ['FF0000']},
+  'SVM Flood inside Grass outside Official 2025',
+  true
+);
