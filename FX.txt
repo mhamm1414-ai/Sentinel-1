@@ -1,0 +1,891 @@
+/************************************************************
+ Imports
+ ************************************************************/
+var studyArea = table;     
+var officialFlood = table3;
+
+/************************************************************
+Date
+ ************************************************************/
+var postStart = '2025-01-01';
+var postEnd   = '2025-01-07';
+
+/************************************************************
+Settings
+ ************************************************************/
+var pol = 'VH';                 
+var orbitPass = 'DESCENDING';  
+var thresholdDb = -16; 
+var useSlopeMask = false;
+var slopeThreshold = 5;
+var compareBufferMeters = 50;
+
+/************************************************************
+Conversion functions
+ ************************************************************/
+function dbToNatural(img) {
+  return ee.Image(10).pow(img.divide(10));
+}
+
+function naturalToDb(img) {
+  return ee.Image(img).log10().multiply(10);
+}
+
+/************************************************************
+Speckle filtering function
+Apply filtering to each image before compositing
+ ************************************************************/
+function reduceSpeckleNoise(image) {
+  var nat = dbToNatural(image);
+  
+  var filtered = nat.focal_median({
+    radius: 20,
+    units: 'meters'
+  });
+  
+  return naturalToDb(filtered)
+    .rename([pol])
+    .copyProperties(image, image.propertyNames());
+}
+
+/************************************************************
+Sentinel-1
+ ************************************************************/
+var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(studyArea)
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', pol))
+  .filter(ee.Filter.eq('resolution_meters', 10))
+  .filter(ee.Filter.eq('orbitProperties_pass', orbitPass))
+  .select(pol);
+
+print('Total S1 images over study area:', s1.size());
+print(
+  'Available dates:',
+  s1.aggregate_array('system:time_start').map(function(t) {
+    return ee.Date(t).format('YYYY-MM-dd');
+  })
+);
+
+/************************************************************
+Post-flood collection only
+ ************************************************************/
+var postCol = s1.filterDate(postStart, postEnd);
+
+print('Post-flood image count:', postCol.size());
+
+print(
+  'Post-flood dates:',
+  postCol.aggregate_array('system:time_start').map(function(t) {
+    return ee.Date(t).format('YYYY-MM-dd');
+  })
+);
+
+/************************************************************
+Post-flood image
+Speckle filtering is applied before median composite
+ ************************************************************/
+var postFilteredDb = postCol
+  .map(reduceSpeckleNoise)
+  .median()
+  .clip(studyArea);
+
+/************************************************************
+Global land cover
+ESA WorldCover
+Grassland class = 30
+ ************************************************************/
+var worldCover = ee.ImageCollection('ESA/WorldCover/v200')
+  .filterBounds(studyArea)
+  .first()
+  .select('Map')
+  .clip(studyArea);
+
+var grassMask = worldCover.eq(30).selfMask();
+
+/************************************************************
+Threshold-only flood extraction
+ ************************************************************/
+var floodCandidate = postFilteredDb.lt(thresholdDb).selfMask();
+
+var floodClean = floodCandidate
+  .focal_max({radius: 10, units: 'meters'})
+  .focal_min({radius: 10, units: 'meters'})
+  .selfMask();
+
+/************************************************************
+To remove slope areas
+ ************************************************************/
+var finalFlood;
+if (useSlopeMask) {
+  var dem = ee.Image('USGS/SRTMGL1_003');
+  var slope = ee.Terrain.slope(dem);
+
+  finalFlood = floodClean.updateMask(slope.lt(slopeThreshold)).selfMask();
+
+  Map.addLayer(
+    slope.clip(studyArea),
+    {min: 0, max: 20},
+    'Slope',
+    false
+  );
+} else {
+  finalFlood = floodClean;
+}
+
+/************************************************************
+Buffer
+ ************************************************************/
+var compareRegion = officialFlood.geometry().buffer(compareBufferMeters);
+
+/************************************************************
+Layers
+ ************************************************************/
+var postBuffer = postFilteredDb.clip(compareRegion);
+var finalFloodBuffer = finalFlood.clip(compareRegion);
+
+var officialRaster = ee.Image().byte().paint({
+  featureCollection: officialFlood,
+  color: 1
+}).selfMask().clip(compareRegion);
+
+/************************************************************
+Intersection
+ ************************************************************/
+var intersectionFinal = finalFloodBuffer.and(officialRaster).selfMask();
+
+/************************************************************
+Function to calculate area
+ ************************************************************/
+function calcAreaKm2(maskImage, region) {
+  var areaDict = ee.Image.pixelArea()
+    .updateMask(maskImage)
+    .reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: region,
+      scale: 10,
+      maxPixels: 1e13
+    });
+  
+  var area = areaDict.get('area');
+  area = ee.Number(ee.Algorithms.If(area, area, 0));
+  return area.divide(1e6);
+}
+
+/************************************************************
+Area calculations
+ ************************************************************/
+var finalFloodArea = calcAreaKm2(finalFloodBuffer, compareRegion);
+var officialArea = calcAreaKm2(officialRaster, compareRegion);
+var intersectionFinalArea = calcAreaKm2(intersectionFinal, compareRegion);
+
+var overlapFinal = intersectionFinalArea.divide(officialArea).multiply(100);
+
+/************************************************************
+Print results
+ ************************************************************/
+print('========== Areas inside buffer ==========');
+print('Official flood area in buffer (km²):', officialArea);
+print('Extracted final flood area in buffer (km²):', finalFloodArea);
+print('Intersection: finalFlood vs official (km²):', intersectionFinalArea);
+print('Overlap: finalFlood vs official (%):', overlapFinal);
+
+/************************************************************
+Map display
+ ************************************************************/
+Map.centerObject(studyArea, 12);
+
+Map.addLayer(
+  ee.Image().paint(studyArea, 1, 2),
+  {palette: ['FF0000']},
+  'Study Area Outline',
+  true
+);
+
+Map.addLayer(
+  worldCover,
+  {
+    min: 10,
+    max: 100,
+    palette: [
+      '006400', 'ffbb22', 'ffff4c', 'f096ff', 'fa0000',
+      'b4b4b4', 'f0f0f0', '0064c8', '0096a0', '00cf75', 'fae6a0'
+    ]
+  },
+  'WorldCover',
+  false
+);
+
+Map.addLayer(
+  grassMask,
+  {palette: ['00FF00']},
+  'Grass Mask',
+  false
+);
+
+Map.addLayer(
+  postFilteredDb,
+  {min: -25, max: -5},
+  'Post-flood Image',
+  false
+);
+
+Map.addLayer(
+  floodCandidate,
+  {palette: ['0000FF']},
+  'Flood Candidate (Threshold Only)',
+  false
+);
+
+Map.addLayer(
+  finalFlood,
+  {palette: ['00FFFF']},
+  'Final Flood Map',
+  true
+);
+
+/************************************************************
+Buffer layers
+ ************************************************************/
+Map.addLayer(
+  ee.Image().paint(compareRegion, 1, 2),
+  {palette: ['FF0000']},
+  'Comparison Buffer',
+  true
+);
+
+Map.addLayer(
+  postBuffer,
+  {min: -25, max: -5},
+  'Post-flood Image (Buffer)',
+  false
+);
+
+Map.addLayer(
+  officialRaster,
+  {palette: ['FFFF00']},
+  'Official Flood',
+  true
+);
+
+Map.addLayer(
+  finalFloodBuffer,
+  {palette: ['00FFFF']},
+  'Extracted Flood (Buffer)',
+  false
+);
+
+Map.addLayer(
+  intersectionFinal,
+  {palette: ['00FF00']},
+  'Overlap: Final Flood vs Official',
+  true
+);
+
+/************************************************************
+Whole study area flood area
+ ************************************************************/
+var floodAreaImage = ee.Image.pixelArea().updateMask(finalFlood).rename('area');
+
+var floodAreaStats = floodAreaImage.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: studyArea.geometry(),
+  scale: 10,
+  maxPixels: 1e13
+});
+
+var areaM2 = ee.Number(floodAreaStats.get('area'));
+var areaKm2 = areaM2.divide(1e6);
+
+print('========== Whole study area ==========');
+print('Final flood area (m²):', areaM2);
+print('Final flood area (km²):', areaKm2);
+
+/************************************************************
+Histogram for post-flood backscatter
+ ************************************************************/
+var histPost = ui.Chart.image.histogram({
+  image: postFilteredDb,
+  region: studyArea,
+  scale: 10,
+  maxPixels: 1e13
+}).setOptions({
+  title: 'Post-flood Backscatter Histogram',
+  hAxis: {title: 'Backscatter (dB)'},
+  vAxis: {title: 'Pixel Count'},
+  legend: {position: 'none'}
+});
+
+print(histPost);
+
+/************************************************************
+Confusion metrics
+ ************************************************************/
+function calcMetrics(predMask, refMask, region) {
+  var pred = predMask.unmask(0);
+  var ref = refMask.unmask(0);
+
+  var tp = ee.Image.pixelArea().updateMask(pred.and(ref)).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: region,
+    scale: 10,
+    maxPixels: 1e13
+  }).values().get(0);
+
+  var fp = ee.Image.pixelArea().updateMask(pred.and(ref.not())).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: region,
+    scale: 10,
+    maxPixels: 1e13
+  }).values().get(0);
+
+  var fn = ee.Image.pixelArea().updateMask(pred.not().and(ref)).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: region,
+    scale: 10,
+    maxPixels: 1e13
+  }).values().get(0);
+
+  tp = ee.Number(tp);
+  fp = ee.Number(fp);
+  fn = ee.Number(fn);
+
+  var precision = ee.Algorithms.If(
+    tp.add(fp).gt(0),
+    tp.divide(tp.add(fp)),
+    0
+  );
+
+  var recall = ee.Algorithms.If(
+    tp.add(fn).gt(0),
+    tp.divide(tp.add(fn)),
+    0
+  );
+
+  var iou = ee.Algorithms.If(
+    tp.add(fp).add(fn).gt(0),
+    tp.divide(tp.add(fp).add(fn)),
+    0
+  );
+
+  precision = ee.Number(precision);
+  recall = ee.Number(recall);
+  iou = ee.Number(iou);
+
+  var f1 = ee.Algorithms.If(
+    precision.add(recall).gt(0),
+    precision.multiply(recall).multiply(2).divide(precision.add(recall)),
+    0
+  );
+
+  return ee.Dictionary({
+    TP_km2: tp.divide(1e6),
+    FP_km2: fp.divide(1e6),
+    FN_km2: fn.divide(1e6),
+    Precision: precision,
+    Recall: recall,
+    IoU: iou,
+    F1: ee.Number(f1)
+  });
+}
+
+/************************************************************
+Run metrics
+ ************************************************************/
+var metricsFinal = calcMetrics(finalFloodBuffer, officialRaster, compareRegion);
+print('Metrics: finalFlood vs official', metricsFinal);
+
+/************************************************************
+TP / FP / FN layers
+ ************************************************************/
+var predEval = finalFloodBuffer.unmask(0);
+var refEval = officialRaster.unmask(0);
+
+var tpLayer = predEval.and(refEval).selfMask();
+var fpLayer = predEval.and(refEval.not()).selfMask();
+var fnLayer = predEval.not().and(refEval).selfMask();
+
+/************************************************************
+TP / FP / FN areas
+ ************************************************************/
+print('TP area (km²):', calcAreaKm2(tpLayer, compareRegion));
+print('FP area (km²):', calcAreaKm2(fpLayer, compareRegion));
+print('FN area (km²):', calcAreaKm2(fnLayer, compareRegion));
+
+/************************************************************
+TP / FP / FN maps
+ ************************************************************/
+Map.addLayer(
+  tpLayer,
+  {palette: ['00FF00']},
+  'TP',
+  false
+);
+
+Map.addLayer(
+  fpLayer,
+  {palette: ['FFA500']},
+  'FP',
+  false
+);
+
+Map.addLayer(
+  fnLayer,
+  {palette: ['FFA500']},
+  'FN',
+  false
+);
+/************************************************************
+Grass flood bias check
+Checks if grass is being classified as flood too much
+ ************************************************************/
+
+var nonGrassMask = grassMask.unmask(0).not().selfMask();
+
+/* Areas */
+var grassAreaKm2 = calcAreaKm2(grassMask, studyArea);
+var nonGrassAreaKm2 = calcAreaKm2(nonGrassMask, studyArea);
+
+var floodInsideGrassKm2 = calcAreaKm2(
+  finalFlood.updateMask(grassMask).selfMask(),
+  studyArea
+);
+
+var floodInsideNonGrassKm2 = calcAreaKm2(
+  finalFlood.updateMask(nonGrassMask).selfMask(),
+  studyArea
+);
+
+var totalFloodKm2 = calcAreaKm2(finalFlood, studyArea);
+
+/* Percentages */
+var grassFloodRate = floodInsideGrassKm2
+  .divide(grassAreaKm2)
+  .multiply(100);
+
+var nonGrassFloodRate = floodInsideNonGrassKm2
+  .divide(nonGrassAreaKm2)
+  .multiply(100);
+
+var grassFloodBiasRatio = grassFloodRate
+  .divide(nonGrassFloodRate);
+
+var percentExtractedFloodInGrass = floodInsideGrassKm2
+  .divide(totalFloodKm2)
+  .multiply(100);
+
+/* Print */
+print('========== Grass flood bias check ==========');
+print('Total grass area, km²:', grassAreaKm2);
+print('Grass predicted as flood, km²:', floodInsideGrassKm2);
+print('Grass flood rate, %:', grassFloodRate);
+
+print('Total non-grass area, km²:', nonGrassAreaKm2);
+print('Non-grass predicted as flood, km²:', floodInsideNonGrassKm2);
+print('Non-grass flood rate, %:', nonGrassFloodRate);
+
+print('Percent of extracted flood located in grass, %:', percentExtractedFloodInGrass);
+print('ONE NUMBER - Grass flood bias ratio:', grassFloodBiasRatio);
+
+/* Map layers for checking */
+Map.addLayer(
+  finalFlood.updateMask(grassMask),
+  {palette: ['FF0000']},
+  'Predicted Flood inside Grass',
+  true
+);
+
+Map.addLayer(
+  finalFlood.updateMask(nonGrassMask),
+  {palette: ['0000FF']},
+  'Predicted Flood outside Grass',
+  false
+);
+/************************************************************
+ Grass false alarm analysis
+ ************************************************************/
+var grassFalseFlood = grassMask
+  .and(finalFlood)
+  .and(officialRaster.unmask(0).not())
+  .selfMask();
+
+var grassFalseFloodKm2 = calcAreaKm2(
+  grassFalseFlood,
+  compareRegion
+);
+
+var grassFloodTotalKm2 = calcAreaKm2(
+  finalFlood.updateMask(grassMask),
+  compareRegion
+);
+
+var grassFalseAlarmPercent = grassFalseFloodKm2
+  .divide(grassFloodTotalKm2)
+  .multiply(100);
+
+print('Grass flood area (km²):', grassFloodTotalKm2);
+print('Grass flood outside official flood (km²):', grassFalseFloodKm2);
+print('Grass false alarm percent (%):', grassFalseAlarmPercent);
+
+/************************************************************
+ New layer: whole study area flood map
+ after removing small isolated patches
+ ************************************************************/
+var minPatchPixels = 150;
+
+var connectedFloodPixels = finalFlood.connectedPixelCount({
+  maxSize: 1000,
+  eightConnected: true
+});
+
+var floodWholeStudyArea_NoSmallPatches = finalFlood
+  .updateMask(connectedFloodPixels.gte(minPatchPixels))
+  .clip(studyArea)
+  .selfMask();
+
+Map.addLayer(
+  floodWholeStudyArea_NoSmallPatches,
+  {palette: ['FF0000']},
+  'Flood Whole Study Area - No Small Patches',
+  true
+);
+
+
+/************************************************************
+Study Area Area
+************************************************************/
+var studyAreaArea = ee.Number(
+  studyArea.geometry().area()
+);
+
+var studyAreaAreaKm2 = studyAreaArea.divide(1e6);
+
+print('========== Study Area ==========');
+print('Study Area (m²):', studyAreaArea);
+print('Study Area (km²):', studyAreaAreaKm2);
+/************************************************************
+Official Flood Area (Vector)
+************************************************************/
+
+var officialFloodArea = officialFlood.geometry().area();
+var officialFloodAreaKm2 = ee.Number(officialFloodArea).divide(1e6);
+
+print('Official Flood Area (m²):', officialFloodArea);
+print('Official Flood Area (km²):', officialFloodAreaKm2);
+/************************************************************
+All green land classes inside official flood only
+ESA WorldCover:
+10 = Tree cover
+20 = Shrubland
+30 = Grassland
+40 = Cropland
+90 = Herbaceous wetland
+95 = Mangroves
+************************************************************/
+
+var greenLandMask = worldCover.eq(10)
+  .or(worldCover.eq(20))
+  .or(worldCover.eq(30))
+  .or(worldCover.eq(40))
+  .or(worldCover.eq(90))
+  .or(worldCover.eq(95))
+  .selfMask()
+  .rename('greenLand');
+
+/************************************************************
+Official flood raster over the exact official flood extent
+************************************************************/
+
+var officialFloodRasterFull = ee.Image()
+  .byte()
+  .paint({
+    featureCollection: officialFlood,
+    color: 1
+  })
+  .selfMask()
+  .clip(officialFlood.geometry())
+  .rename('officialFlood');
+
+/************************************************************
+Green land located inside official flood
+************************************************************/
+
+var greenLandInsideOfficialFlood = officialFloodRasterFull
+  .updateMask(greenLandMask)
+  .selfMask()
+  .rename('greenInsideOfficialFlood');
+
+/************************************************************
+Calculate areas
+************************************************************/
+
+var officialFloodTotalKm2 = calcAreaKm2(
+  officialFloodRasterFull,
+  officialFlood.geometry()
+);
+
+var greenInsideOfficialFloodKm2 = calcAreaKm2(
+  greenLandInsideOfficialFlood,
+  officialFlood.geometry()
+);
+
+/************************************************************
+Percentage of official flood that is green land
+************************************************************/
+
+var greenPercentOfOfficialFlood = ee.Number(
+  ee.Algorithms.If(
+    officialFloodTotalKm2.gt(0),
+    greenInsideOfficialFloodKm2
+      .divide(officialFloodTotalKm2)
+      .multiply(100),
+    0
+  )
+);
+
+/************************************************************
+Print results
+************************************************************/
+
+print('========== Green land inside official flood ==========');
+
+print(
+  'Total official flood area, km²:',
+  officialFloodTotalKm2
+);
+
+print(
+  'Green land inside official flood, km²:',
+  greenInsideOfficialFloodKm2
+);
+
+print(
+  'Percentage of official flood covered by green land, %:',
+  greenPercentOfOfficialFlood
+);
+
+/************************************************************
+Map layers
+************************************************************/
+
+Map.addLayer(
+  greenLandMask,
+  {palette: ['00AA00']},
+  'All Green Land Classes',
+  false
+);
+
+Map.addLayer(
+  officialFloodRasterFull,
+  {palette: ['0000FF']},
+  'Official Flood Full Extent',
+  false
+);
+
+Map.addLayer(
+  greenLandInsideOfficialFlood,
+  {palette: ['00FF00']},
+  'Green Land inside Official Flood',
+  true
+);
+print(
+  'Relative orbit numbers:',
+  s1.aggregate_histogram('relativeOrbitNumber_start')
+);
+
+      /************************************************************
+ ESA WorldCover
+ Vegetated classes inside OFFICIAL flood
+************************************************************/
+
+// WorldCover
+var esaLC = ee.ImageCollection('ESA/WorldCover/v200')
+  .first()
+  .select('Map');
+
+// Official flood raster
+var officialFloodRasterESA = ee.Image()
+  .byte()
+  .paint({
+    featureCollection: officialFlood,
+    color: 1
+  })
+  .selfMask();
+
+
+// ==========================================================
+// 10 = Tree cover
+// ==========================================================
+
+var esaTrees = esaLC.eq(10).selfMask();
+
+var esaTreesInsideFlood = esaTrees
+  .updateMask(officialFloodRasterESA)
+  .clip(officialFlood.geometry());
+
+var esaTreesKm2 = calcAreaKm2(
+  esaTreesInsideFlood,
+  officialFlood.geometry()
+);
+
+
+// ==========================================================
+// 20 = Shrubland
+// ==========================================================
+
+var esaShrubland = esaLC.eq(20).selfMask();
+
+var esaShrublandInsideFlood = esaShrubland
+  .updateMask(officialFloodRasterESA)
+  .clip(officialFlood.geometry());
+
+var esaShrublandKm2 = calcAreaKm2(
+  esaShrublandInsideFlood,
+  officialFlood.geometry()
+);
+
+
+// ==========================================================
+// 30 = Grassland
+// ==========================================================
+
+var esaGrassland = esaLC.eq(30).selfMask();
+
+var esaGrasslandInsideFlood = esaGrassland
+  .updateMask(officialFloodRasterESA)
+  .clip(officialFlood.geometry());
+
+var esaGrasslandKm2 = calcAreaKm2(
+  esaGrasslandInsideFlood,
+  officialFlood.geometry()
+);
+
+
+// ==========================================================
+// 40 = Cropland
+// ==========================================================
+
+var esaCropland = esaLC.eq(40).selfMask();
+
+var esaCroplandInsideFlood = esaCropland
+  .updateMask(officialFloodRasterESA)
+  .clip(officialFlood.geometry());
+
+var esaCroplandKm2 = calcAreaKm2(
+  esaCroplandInsideFlood,
+  officialFlood.geometry()
+);
+
+
+// ==========================================================
+// 90 = Herbaceous wetland
+// ==========================================================
+
+var esaWetland = esaLC.eq(90).selfMask();
+
+var esaWetlandInsideFlood = esaWetland
+  .updateMask(officialFloodRasterESA)
+  .clip(officialFlood.geometry());
+
+var esaWetlandKm2 = calcAreaKm2(
+  esaWetlandInsideFlood,
+  officialFlood.geometry()
+);
+
+
+// ==========================================================
+// 95 = Mangroves
+// ==========================================================
+
+var esaMangroves = esaLC.eq(95).selfMask();
+
+var esaMangrovesInsideFlood = esaMangroves
+  .updateMask(officialFloodRasterESA)
+  .clip(officialFlood.geometry());
+
+var esaMangrovesKm2 = calcAreaKm2(
+  esaMangrovesInsideFlood,
+  officialFlood.geometry()
+);
+
+
+// ==========================================================
+// ALL VEGETATED AREAS
+// 10 + 20 + 30 + 40 + 90 + 95
+// ==========================================================
+
+var esaVegetated = esaLC.eq(10)
+  .or(esaLC.eq(20))
+  .or(esaLC.eq(30))
+  .or(esaLC.eq(40))
+  .or(esaLC.eq(90))
+  .or(esaLC.eq(95))
+  .selfMask();
+
+var esaVegetatedInsideFlood = esaVegetated
+  .updateMask(officialFloodRasterESA)
+  .clip(officialFlood.geometry());
+
+var esaVegetatedKm2 = calcAreaKm2(
+  esaVegetatedInsideFlood,
+  officialFlood.geometry()
+);
+
+
+// ==========================================================
+// Percentage of official flood
+// ==========================================================
+
+var officialFloodKm2ESA = calcAreaKm2(
+  officialFloodRasterESA,
+  officialFlood.geometry()
+);
+
+var esaVegetatedPercent = esaVegetatedKm2
+  .divide(officialFloodKm2ESA)
+  .multiply(100);
+
+
+// ==========================================================
+// PRINT
+// ==========================================================
+
+print('========== ESA WORLDCOVER - OFFICIAL FLOOD ==========');
+
+print('Tree cover (10) inside flood, km²:',
+      esaTreesKm2);
+
+print('Shrubland (20) inside flood, km²:',
+      esaShrublandKm2);
+
+print('Grassland (30) inside flood, km²:',
+      esaGrasslandKm2);
+
+print('Cropland (40) inside flood, km²:',
+      esaCroplandKm2);
+
+print('Herbaceous wetland (90) inside flood, km²:',
+      esaWetlandKm2);
+
+print('Mangroves (95) inside flood, km²:',
+      esaMangrovesKm2);
+
+print('TOTAL Vegetated areas inside flood, km²:',
+      esaVegetatedKm2);
+
+print('Vegetated areas percentage of official flood, %:',
+      esaVegetatedPercent);
+// Print every date included in the filterDate window
+var startDate = ee.Date(postStart);
+var endDate = ee.Date(postEnd);
+
+var numberOfDays = endDate.difference(startDate, 'day');
+
+var includedDates = ee.List.sequence(0, numberOfDays.subtract(1))
+  .map(function(day) {
+    return startDate
+      .advance(ee.Number(day), 'day')
+      .format('YYYY-MM-dd');
+  });
+
+print('All dates INCLUDED in post-flood period:', includedDates);

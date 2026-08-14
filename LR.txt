@@ -1,0 +1,1093 @@
+/************************************************************
+LOGISTIC REGRESSION FLOOD MAPPING
+Sentinel-1 — Python-trained coefficients
+************************************************************/
+
+/************************************************************
+Imports
+************************************************************/
+var studyArea = table;
+var flood2025 = table4;
+var flood2021 = table5;
+
+/************************************************************
+Dates for Sentinel-1
+************************************************************/
+
+// Training event: Flood 20 January 2021
+var trainPreStart  = '2021-01-01';
+var trainPreEnd    = '2021-01-15';
+
+var trainPostStart = '2021-01-20';
+var trainPostEnd   = '2021-01-26';
+
+// Testing event: Flood 1 January 2025
+var testPreStart   = '2024-12-10';
+var testPreEnd     = '2024-12-25';
+
+var testPostStart  = '2025-01-01';
+var testPostEnd    = '2025-01-07';
+
+/************************************************************
+Settings
+************************************************************/
+var orbitPass = 'DESCENDING';
+
+var compareBufferMeters = 50;
+
+var sampleScale = 10;
+var pointsPerClass = 1500;
+var randomSeed = 42;
+
+// Morphological Closing radius
+var morphologyRadius = 10;
+
+/************************************************************
+Conversion functions
+************************************************************/
+function dbToNatural(img) {
+  return ee.Image(10).pow(img.divide(10));
+}
+
+function naturalToDb(img) {
+  return ee.Image(img).log10().multiply(10);
+}
+
+/************************************************************
+Speckle filtering
+************************************************************/
+function reduceSpeckleNoise(image) {
+
+  var vvNat = dbToNatural(
+    image.select('VV')
+  );
+
+  var vhNat = dbToNatural(
+    image.select('VH')
+  );
+
+  var vvFiltered = vvNat.focal_median({
+    radius: 20,
+    units: 'meters'
+  });
+
+  var vhFiltered = vhNat.focal_median({
+    radius: 20,
+    units: 'meters'
+  });
+
+  return ee.Image.cat([
+    naturalToDb(vvFiltered).rename('VV'),
+    naturalToDb(vhFiltered).rename('VH')
+  ])
+  .copyProperties(
+    image,
+    image.propertyNames()
+  );
+}
+
+/************************************************************
+Sentinel-1 collection
+************************************************************/
+var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+
+  .filterBounds(studyArea)
+
+  .filter(
+    ee.Filter.eq(
+      'instrumentMode',
+      'IW'
+    )
+  )
+
+  .filter(
+    ee.Filter.listContains(
+      'transmitterReceiverPolarisation',
+      'VV'
+    )
+  )
+
+  .filter(
+    ee.Filter.listContains(
+      'transmitterReceiverPolarisation',
+      'VH'
+    )
+  )
+
+  .filter(
+    ee.Filter.eq(
+      'resolution_meters',
+      10
+    )
+  )
+
+  .filter(
+    ee.Filter.eq(
+      'orbitProperties_pass',
+      orbitPass
+    )
+  )
+
+  .select(['VV', 'VH']);
+
+print(
+  'Total Sentinel-1 images:',
+  s1.size()
+);
+
+/************************************************************
+Build Sentinel-1 composite
+************************************************************/
+function buildS1Composite(
+  preStart,
+  preEnd,
+  postStart,
+  postEnd,
+  region
+) {
+
+  var preCol = s1.filterDate(
+    preStart,
+    preEnd
+  );
+
+  var postCol = s1.filterDate(
+    postStart,
+    postEnd
+  );
+
+  print(
+    'S1 Pre image count (' +
+    preStart + ' to ' + preEnd + '):',
+    preCol.size()
+  );
+
+  print(
+    'S1 Post image count (' +
+    postStart + ' to ' + postEnd + '):',
+    postCol.size()
+  );
+
+  print(
+    'Pre dates:',
+    preCol
+      .aggregate_array('system:time_start')
+      .map(function(time) {
+        return ee.Date(time)
+          .format('YYYY-MM-dd');
+      })
+  );
+
+  print(
+    'Post dates:',
+    postCol
+      .aggregate_array('system:time_start')
+      .map(function(time) {
+        return ee.Date(time)
+          .format('YYYY-MM-dd');
+      })
+  );
+
+  var pre = preCol
+    .map(reduceSpeckleNoise)
+    .median()
+    .clip(region);
+
+  var post = postCol
+    .map(reduceSpeckleNoise)
+    .median()
+    .clip(region);
+
+  return {
+    pre: pre,
+    post: post
+  };
+}
+
+/************************************************************
+Sentinel-1 feature stack
+************************************************************/
+function buildS1Features(
+  preImg,
+  postImg
+) {
+
+  var preVV = preImg
+    .select('VV')
+    .rename('preVV');
+
+  var preVH = preImg
+    .select('VH')
+    .rename('preVH');
+
+  var postVV = postImg
+    .select('VV')
+    .rename('postVV');
+
+  var postVH = postImg
+    .select('VH')
+    .rename('postVH');
+
+  var diffVV = preVV
+    .subtract(postVV)
+    .rename('diffVV');
+
+  var diffVH = preVH
+    .subtract(postVH)
+    .rename('diffVH');
+
+  var sumPre = preVV
+    .add(preVH)
+    .rename('sumPre');
+
+  var sumPost = postVV
+    .add(postVH)
+    .rename('sumPost');
+
+  var diffSum = sumPre
+    .subtract(sumPost)
+    .rename('diffSum');
+
+  return ee.Image.cat([
+    preVV,
+    preVH,
+    postVV,
+    postVH,
+    diffVV,
+    diffVH,
+    sumPre,
+    sumPost,
+    diffSum
+  ]);
+}
+
+/************************************************************
+Terrain and spatial features
+These are retained for display and possible analysis,
+but they are not used in the new Logistic Regression model.
+************************************************************/
+var dem = ee.Image(
+  'USGS/SRTMGL1_003'
+)
+.select('elevation')
+.clip(studyArea)
+.rename('DEM');
+
+var slope = ee.Terrain
+  .slope(dem)
+  .rename('slope');
+
+var rivers = ee.FeatureCollection(
+  'WWF/HydroSHEDS/v1/FreeFlowingRivers'
+)
+.filterBounds(studyArea);
+
+var riverRaster = ee.Image()
+  .byte()
+  .paint({
+    featureCollection: rivers,
+    color: 1
+  })
+  .clip(studyArea);
+
+var distanceToRiver = riverRaster
+  .fastDistanceTransform(1024)
+  .sqrt()
+  .multiply(
+    ee.Image.pixelArea().sqrt()
+  )
+  .unmask(99999)
+  .rename('distanceToRiver')
+  .clip(studyArea);
+
+var waterOccurrence = ee.Image(
+  'JRC/GSW1_4/GlobalSurfaceWater'
+)
+.select('occurrence')
+.unmask(0)
+.clip(studyArea)
+.rename('waterOccurrence');
+
+var terrainFeatures = ee.Image.cat([
+  dem,
+  slope,
+  distanceToRiver,
+  waterOccurrence
+])
+.toFloat();
+
+/************************************************************
+Build training and testing composites
+************************************************************/
+var trainS1 = buildS1Composite(
+  trainPreStart,
+  trainPreEnd,
+  trainPostStart,
+  trainPostEnd,
+  studyArea
+);
+
+var testS1 = buildS1Composite(
+  testPreStart,
+  testPreEnd,
+  testPostStart,
+  testPostEnd,
+  studyArea
+);
+
+/************************************************************
+Build radar features
+************************************************************/
+var trainRadarFeatures = buildS1Features(
+  trainS1.pre,
+  trainS1.post
+);
+
+var testRadarFeatures = buildS1Features(
+  testS1.pre,
+  testS1.post
+);
+
+/************************************************************
+Complete feature stacks
+************************************************************/
+var trainFeatures = trainRadarFeatures
+  .addBands(terrainFeatures)
+  .toFloat();
+
+var testFeatures = testRadarFeatures
+  .addBands(terrainFeatures)
+  .toFloat();
+
+/************************************************************
+Training label from official 2021 flood
+No 50 m buffer is applied to the flood polygon.
+************************************************************/
+var flood2021Raster = ee.Image()
+  .byte()
+  .paint({
+    featureCollection: flood2021,
+    color: 1
+  })
+  .selfMask()
+  .clip(studyArea)
+  ;
+
+var label2021 = ee.Image
+  .constant(0)
+  .clip(studyArea)
+  .where(
+    flood2021Raster,
+    1
+  )
+  .rename('class')
+  .toByte();
+
+/************************************************************
+Stratified sampling diagnostics
+Sampling is performed over the whole study area.
+************************************************************/
+var trainingImage = trainFeatures
+  .addBands(label2021);
+
+var samples = trainingImage
+  .stratifiedSample({
+    numPoints: pointsPerClass,
+    classBand: 'class',
+    region: studyArea.geometry(),
+    scale: sampleScale,
+    seed: randomSeed,
+    geometries: true,
+    dropNulls: true,
+    tileScale: 4
+  });
+
+print(
+  'Training samples:',
+  samples.size()
+);
+
+print(
+  'Class distribution:',
+  samples.aggregate_histogram('class')
+);
+
+/************************************************************
+Logistic Regression model
+
+The order must exactly match the Python order:
+diffVH, diffVV, postVH, postVV, preVH, preVV
+************************************************************/
+var bands = [
+  'diffVH',
+  'diffVV',
+  'postVH',
+  'postVV',
+  'preVH',
+  'preVV'
+];
+
+/************************************************************
+Python-trained Logistic Regression parameters
+************************************************************/
+/************************************************************
+Python-trained Logistic Regression parameters
+************************************************************/
+
+var intercept =
+  -0.10661359847066525;
+
+var coefficients = [
+   0.02167562281279925,   // diffVH
+  -0.20962134671951674,   // diffVV
+  -0.0014087285918233275, // postVH
+  -0.8894862257006326,    // postVV
+   0.009905091736059753,  // preVH
+  -1.058309049430006      // preVV
+];
+
+var means = [
+   0.037420645890683335,  // diffVH
+  -0.04571752052474333,   // diffVV
+ -15.875507831303333,     // postVH
+  -8.800660985959334,     // postVV
+ -15.83808716089,         // preVH
+  -8.846378495015001      // preVV
+];
+
+var stds = [
+  1.5317594585850032,     // diffVH
+  1.6415157682468566,     // diffVV
+  3.175247435699057,      // postVH
+  3.5060062577133113,     // postVV
+  2.9003962810171746,     // preVH
+  3.2718617212380874      // preVV
+];
+/************************************************************
+Standardize 2025 features
+************************************************************/
+var meanImg = ee.Image
+  .constant(means)
+  .rename(bands);
+
+var stdImg = ee.Image
+  .constant(stds)
+  .rename(bands);
+
+var coefImg = ee.Image
+  .constant(coefficients)
+  .rename(bands);
+
+var standardized = testFeatures
+  .select(bands)
+  .subtract(meanImg)
+  .divide(stdImg);
+
+/************************************************************
+Logistic Regression equation
+z = intercept + sum(coefficient × standardized feature)
+************************************************************/
+var z = standardized
+  .multiply(coefImg)
+  .reduce(
+    ee.Reducer.sum()
+  )
+  .add(intercept);
+
+/************************************************************
+Probability
+p = 1 / (1 + exp(-z))
+************************************************************/
+var prob2025 = ee.Image(1)
+  .divide(
+    ee.Image(1)
+      .add(
+        z.multiply(-1).exp()
+      )
+  )
+  .rename('probability');
+
+/************************************************************
+Automatic classification
+************************************************************/
+var rawFlood2025 = prob2025
+  .gte(0.5)
+  .rename('pred_raw');
+
+/************************************************************
+Morphological cleaning
+
+Closing:
+1. Dilation = focal_max
+2. Erosion = focal_min
+
+Radius = 10 metres
+************************************************************/
+var finalFlood2025 = rawFlood2025
+
+  .focal_max({
+    radius: morphologyRadius,
+    units: 'meters'
+  })
+
+  .focal_min({
+    radius: morphologyRadius,
+    units: 'meters'
+  })
+
+  .rename('predictedFlood')
+
+  .selfMask();
+
+/************************************************************
+Comparison region
+************************************************************/
+var compareRegion = flood2025
+  .geometry()
+  .buffer(compareBufferMeters)
+  ;
+
+/************************************************************
+Official 2025 flood raster
+************************************************************/
+var official2025Raster = ee.Image()
+  .byte()
+  .paint({
+    featureCollection: flood2025,
+    color: 1
+  })
+  .selfMask()
+  .clip(compareRegion)
+  ;
+
+/************************************************************
+Prediction and reference binary images
+************************************************************/
+var predBin = finalFlood2025
+  .unmask(0)
+  .clip(compareRegion)
+  .rename('pred');
+
+var refBin = ee.Image
+  .constant(0)
+  .clip(compareRegion)
+  .where(
+    official2025Raster,
+    1
+  )
+  .rename('ref')
+  .toByte();
+
+/************************************************************
+Diagnostics
+************************************************************/
+var predHist = predBin.reduceRegion({
+  reducer: ee.Reducer.frequencyHistogram(),
+  geometry: compareRegion,
+  scale: 10,
+  maxPixels: 1e13,
+  tileScale: 4
+});
+
+print(
+  'Prediction histogram inside buffer:',
+  predHist
+);
+
+var probStats = prob2025.reduceRegion({
+  reducer: ee.Reducer
+    .minMax()
+    .combine({
+      reducer2: ee.Reducer.mean(),
+      sharedInputs: true
+    }),
+  geometry: compareRegion,
+  scale: 10,
+  maxPixels: 1e13,
+  tileScale: 4
+});
+
+print(
+  'Probability stats inside buffer:',
+  probStats
+);
+
+/************************************************************
+Confusion masks
+************************************************************/
+var tp = predBin
+  .eq(1)
+  .and(refBin.eq(1))
+  .selfMask();
+
+var fp = predBin
+  .eq(1)
+  .and(refBin.eq(0))
+  .selfMask();
+
+var fn = predBin
+  .eq(0)
+  .and(refBin.eq(1))
+  .selfMask();
+
+var tn = predBin
+  .eq(0)
+  .and(refBin.eq(0))
+  .selfMask();
+
+/************************************************************
+Area calculation function
+************************************************************/
+function calcAreaKm2(
+  maskImage,
+  region
+) {
+
+  var area = ee.Image
+    .pixelArea()
+    .updateMask(maskImage)
+    .reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: region,
+      scale: 10,
+      maxPixels: 1e13,
+      tileScale: 4
+    })
+    .values()
+    .get(0);
+
+  area = ee.Number(
+    ee.Algorithms.If(
+      area,
+      area,
+      0
+    )
+  );
+
+  return area.divide(1e6);
+}
+
+/************************************************************
+Areas
+************************************************************/
+var tpArea = calcAreaKm2(
+  tp,
+  compareRegion
+);
+
+var fpArea = calcAreaKm2(
+  fp,
+  compareRegion
+);
+
+var fnArea = calcAreaKm2(
+  fn,
+  compareRegion
+);
+
+var tnArea = calcAreaKm2(
+  tn,
+  compareRegion
+);
+
+var predictedArea = calcAreaKm2(
+  predBin.selfMask(),
+  compareRegion
+);
+
+var officialArea = calcAreaKm2(
+  refBin.selfMask(),
+  compareRegion
+);
+
+/************************************************************
+Accuracy metrics
+************************************************************/
+var precision = ee.Number(
+  ee.Algorithms.If(
+    tpArea.add(fpArea).gt(0),
+
+    tpArea.divide(
+      tpArea.add(fpArea)
+    ),
+
+    0
+  )
+);
+
+var recall = ee.Number(
+  ee.Algorithms.If(
+    tpArea.add(fnArea).gt(0),
+
+    tpArea.divide(
+      tpArea.add(fnArea)
+    ),
+
+    0
+  )
+);
+
+var f1 = ee.Number(
+  ee.Algorithms.If(
+    precision.add(recall).gt(0),
+
+    precision
+      .multiply(recall)
+      .multiply(2)
+      .divide(
+        precision.add(recall)
+      ),
+
+    0
+  )
+);
+
+var iou = ee.Number(
+  ee.Algorithms.If(
+    tpArea
+      .add(fpArea)
+      .add(fnArea)
+      .gt(0),
+
+    tpArea.divide(
+      tpArea
+        .add(fpArea)
+        .add(fnArea)
+    ),
+
+    0
+  )
+);
+
+var accuracy = ee.Number(
+  ee.Algorithms.If(
+    tpArea
+      .add(fpArea)
+      .add(fnArea)
+      .add(tnArea)
+      .gt(0),
+
+    tpArea
+      .add(tnArea)
+      .divide(
+        tpArea
+          .add(fpArea)
+          .add(fnArea)
+          .add(tnArea)
+      ),
+
+    0
+  )
+);
+
+/************************************************************
+Print results
+************************************************************/
+print(
+  '========== MODEL =========='
+);
+
+print(
+  'Logistic Regression using six Sentinel-1 radar features'
+);
+
+print(
+  'Applied using Python-trained coefficients'
+);
+
+print(
+  'Classification threshold: probability >= 0.5'
+);
+
+print(
+  'Morphological operation: Closing'
+);
+
+print(
+  'Morphology radius (m):',
+  morphologyRadius
+);
+
+print(
+  'Bands used:',
+  bands
+);
+
+print(
+  '========== 2025 METRICS =========='
+);
+
+print(
+  'Official flood area in buffer (km²):',
+  officialArea
+);
+
+print(
+  'Predicted flood area in buffer (km²):',
+  predictedArea
+);
+
+print(
+  'TP area (km²):',
+  tpArea
+);
+
+print(
+  'FP area (km²):',
+  fpArea
+);
+
+print(
+  'FN area (km²):',
+  fnArea
+);
+
+print(
+  'TN area (km²):',
+  tnArea
+);
+
+print(
+  'Precision:',
+  precision
+);
+
+print(
+  'Recall:',
+  recall
+);
+
+print(
+  'F1-score:',
+  f1
+);
+
+print(
+  'IoU:',
+  iou
+);
+
+print(
+  'Accuracy:',
+  accuracy
+);
+
+print(
+  'Predicted flood area over whole study area (km²):',
+  calcAreaKm2(
+    finalFlood2025,
+    studyArea.geometry()
+  )
+);
+
+/************************************************************
+Probability statistics over whole study area
+************************************************************/
+print(
+  'Probability statistics over whole study area:',
+  prob2025.reduceRegion({
+    reducer: ee.Reducer
+      .minMax()
+      .combine({
+        reducer2: ee.Reducer.mean(),
+        sharedInputs: true
+      }),
+    geometry: studyArea.geometry(),
+    scale: 10,
+    maxPixels: 1e13,
+    tileScale: 4
+  })
+);
+
+/************************************************************
+Map display
+************************************************************/
+Map.centerObject(
+  studyArea,
+  11
+);
+
+Map.addLayer(
+  ee.Image().paint(
+    studyArea,
+    1,
+    2
+  ),
+  {
+    palette: ['FF0000']
+  },
+  'Study Area',
+  true
+);
+
+Map.addLayer(
+  trainS1.pre.select('VV'),
+  {
+    min: -25,
+    max: -5
+  },
+  'S1 2021 Pre VV',
+  false
+);
+
+Map.addLayer(
+  trainS1.post.select('VV'),
+  {
+    min: -25,
+    max: -5
+  },
+  'S1 2021 Post VV',
+  false
+);
+
+Map.addLayer(
+  testS1.pre.select('VV'),
+  {
+    min: -25,
+    max: -5
+  },
+  'S1 2025 Pre VV',
+  false
+);
+
+Map.addLayer(
+  testS1.post.select('VV'),
+  {
+    min: -25,
+    max: -5
+  },
+  'S1 2025 Post VV',
+  false
+);
+
+Map.addLayer(
+  dem,
+  {
+    min: 0,
+    max: 100
+  },
+  'DEM',
+  false
+);
+
+Map.addLayer(
+  slope,
+  {
+    min: 0,
+    max: 20
+  },
+  'Slope',
+  false
+);
+
+Map.addLayer(
+  distanceToRiver,
+  {
+    min: 0,
+    max: 5000
+  },
+  'Distance to River',
+  false
+);
+
+Map.addLayer(
+  waterOccurrence,
+  {
+    min: 0,
+    max: 100
+  },
+  'Water Occurrence',
+  false
+);
+
+Map.addLayer(
+  prob2025,
+  {
+    min: 0,
+    max: 1,
+    palette: [
+      'FFFFFF',
+      'FFFF00',
+      'FFA500',
+      'FF0000'
+    ]
+  },
+  'Logistic Probability 2025',
+  false
+);
+
+Map.addLayer(
+  flood2021Raster,
+  {
+    palette: ['FFA500']
+  },
+  'Official Flood 2021',
+  false
+);
+
+Map.addLayer(
+  official2025Raster,
+  {
+    palette: ['FFFF00']
+  },
+  'Official Flood 2025',
+  true
+);
+
+Map.addLayer(
+  ee.Image().paint(
+    compareRegion,
+    1,
+    2
+  ),
+  {
+    palette: ['FF00FF']
+  },
+  'Comparison Buffer 2025',
+  true
+);
+
+Map.addLayer(
+  finalFlood2025.clip(compareRegion),
+  {
+    palette: ['00FFFF']
+  },
+  'Predicted Flood 2025 inside buffer',
+  true
+);
+
+Map.addLayer(
+  finalFlood2025,
+  {
+    palette: ['00FFFF']
+  },
+  'Predicted Flood 2025 whole study area',
+  false
+);
+
+Map.addLayer(
+  tp,
+  {
+    palette: ['00FF00']
+  },
+  'True Positive',
+  true
+);
+
+Map.addLayer(
+  fp,
+  {
+    palette: ['FF00FF']
+  },
+  'False Positive',
+  false
+);
+
+Map.addLayer(
+  fn,
+  {
+    palette: ['0000FF']
+  },
+  'False Negative',
+  false
+);
